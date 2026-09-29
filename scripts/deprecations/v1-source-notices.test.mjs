@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import path from "node:path";
 import {
@@ -9,6 +9,7 @@ import {
   repoRoot,
   V2_DOCS,
   V2_REFERENCE,
+  supportedEntrypoints,
   v1Entrypoints,
 } from "./v1-public-api.mjs";
 
@@ -20,7 +21,6 @@ const expectedCounts = new Map([
   ["runtime-langgraph", 6],
   ["sdk-js", 2],
   ["sdk-js-langchain", 15],
-  ["sdk-js-langgraph", 23],
   ["sdk-js-langgraph-middlewares", 3],
 ]);
 
@@ -144,7 +144,33 @@ test("inventory covers every public v1 package entrypoint", () => {
     }
   }
 
+  for (const { importPath } of supportedEntrypoints) {
+    discovered.delete(importPath);
+  }
+
   assert.deepEqual([...configured].sort(), [...discovered].sort());
+});
+
+test("supported entrypoints carry no v1 deprecation", () => {
+  for (const { importPath, sourceRoot } of supportedEntrypoints) {
+    assert.ok(
+      !v1Entrypoints.some((entrypoint) => entrypoint.importPath === importPath),
+      `${importPath} is in the v1 inventory`,
+    );
+    const stamped = inventory.inventories.flatMap(({ exports }) =>
+      exports
+        .filter((item) => item.declarationFile?.startsWith(sourceRoot))
+        .map((item) => `${item.declarationFile}:${item.name}`),
+    );
+    assert.deepEqual(stamped, [], `${sourceRoot} gets a v1 file notice`);
+
+    const directory = path.join(repoRoot, sourceRoot);
+    for (const file of readdirSync(directory)) {
+      if (!file.endsWith(".ts")) continue;
+      const source = readFileSync(path.join(directory, file), "utf8");
+      assert.doesNotMatch(source, /V1 SDK DEPRECATED|@deprecated Since/, file);
+    }
+  }
 });
 
 test("inventory covers every configured v1 importable export", () => {
@@ -161,7 +187,7 @@ test("inventory covers every configured v1 importable export", () => {
     );
     total += exports.length;
   }
-  assert.equal(total, 249);
+  assert.equal(total, 226);
 });
 
 test("every v1 importable export has an IDE-visible use-v2 deprecation", () => {
@@ -302,18 +328,21 @@ test("v1 deprecation aliases do not poison v2 exports", () => {
   const checked = new Set();
   const failures = [];
   for (const { entrypoint, exports } of inventory.inventories) {
-    if (!entrypoint.v2File) continue;
-    const target = inventory.program.getSourceFile(
-      path.join(repoRoot, entrypoint.v2File),
-    );
-    const targetSymbols = new Map(
-      inventory.checker
-        .getExportsOfModule(target.symbol)
-        .map((symbol) => [symbol.name, symbol]),
-    );
+    const targetSymbols = new Map();
+    for (const v2Module of entrypoint.v2Modules) {
+      const target = inventory.program.getSourceFile(
+        path.join(repoRoot, v2Module.file),
+      );
+      for (const symbol of inventory.checker.getExportsOfModule(
+        target.symbol,
+      )) {
+        if (!targetSymbols.has(symbol.name))
+          targetSymbols.set(symbol.name, symbol);
+      }
+    }
     for (const item of exports) {
       if (!item.replacement) continue;
-      const key = `${entrypoint.v2File}:${item.replacement.name}`;
+      const key = `${entrypoint.id}:${item.replacement.name}`;
       if (checked.has(key)) continue;
       checked.add(key);
       const warning = deprecatedText(
@@ -531,7 +560,7 @@ test("related v2 concepts cover other clear migration families", () => {
       },
     ],
     [
-      "sdk-js-langgraph:copilotkitMiddleware",
+      "sdk-js-langchain:CopilotKitStateAnnotation",
       {
         label: "LangGraph agents",
         url: "https://docs.copilotkit.ai/agent-spec/langgraph",
@@ -579,7 +608,7 @@ test("the generic v2 reference is never mislabeled as the v2 docs homepage", () 
   }
 });
 
-test("the agent-readable docs map contains all 249 v1 exports", () => {
+test("the agent-readable docs map contains all 226 v1 exports", () => {
   const source = readFileSync(
     path.join(
       repoRoot,
@@ -605,5 +634,74 @@ test("the agent-readable docs map contains all 249 v1 exports", () => {
       rows += 1;
     }
   }
-  assert.equal(rows, 249);
+  assert.equal(rows, 226);
+});
+
+// PE-123. The replacement lookup used to consult a single `v2File`, and five of
+// the nine entrypoints set it to `null`. For those the lookup could not run, so
+// all 57 of their rows reported "no replacement" by construction rather than by
+// looking. These two tests keep the reach honest: the first pins that every
+// entrypoint really does have somewhere to look, and that the places it looks
+// are published modules rather than private files; the second pins what the
+// widened reach currently finds.
+test("every v1 entrypoint resolves replacements against published v2 modules", () => {
+  for (const entrypoint of v1Entrypoints) {
+    assert.ok(
+      entrypoint.v2Modules?.length > 0,
+      `${entrypoint.id} must list at least one v2 module to look in`,
+    );
+    assert.equal(
+      entrypoint.v2Modules[0].importPath,
+      entrypoint.v2ImportPath,
+      `${entrypoint.id} must look in its documented root v2 entry first`,
+    );
+    for (const { file, importPath } of entrypoint.v2Modules) {
+      assert.ok(
+        existsSync(path.join(repoRoot, file)),
+        `${entrypoint.id} lists a v2 module that does not exist: ${file}`,
+      );
+      // The import path a row prints has to be one a reader can actually
+      // install and import, so it must be a real subpath of a real package.
+      const scoped = importPath.split("/");
+      const packageName = `${scoped[0]}/${scoped[1]}`;
+      const subpath =
+        scoped.length > 2 ? `./${scoped.slice(2).join("/")}` : ".";
+      const manifest = JSON.parse(
+        readFileSync(
+          path.join(repoRoot, "packages", scoped[1], "package.json"),
+          "utf8",
+        ),
+      );
+      assert.equal(manifest.name, packageName);
+      assert.ok(
+        Object.keys(manifest.exports ?? {}).includes(subpath),
+        `${importPath} is not a published export of ${packageName}`,
+      );
+    }
+  }
+});
+
+test("no v1 export's only v2 replacement lives on a non-root subpath", () => {
+  // Measured on 2026-09-17: widening the lookup from one root file to every
+  // published v2 module found nothing the root barrel did not already carry,
+  // so this list is empty and all 213 "no replacement" rows are real answers.
+  //
+  // If this fails, a v2 subpath has grown a symbol sharing a name with a
+  // deprecated v1 export. Triage it before accepting it: a same name is not a
+  // replacement when the shape changed (PE-114 left `RenderFunctionStatus` to
+  // `ToolCallStatus` alone for exactly that reason — string union to enum).
+  // Curate an override if the mapping is real, rather than widening this list.
+  const subpathOnly = inventory.inventories.flatMap(({ entrypoint, exports }) =>
+    exports
+      .filter(
+        (item) =>
+          item.replacement &&
+          item.replacement.resolvedFrom !== entrypoint.v2ImportPath,
+      )
+      .map(
+        (item) =>
+          `${entrypoint.id}:${item.name} <- ${item.replacement.resolvedFrom}`,
+      ),
+  );
+  assert.deepEqual(subpathOnly, []);
 });
